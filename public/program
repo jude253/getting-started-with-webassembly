@@ -1063,11 +1063,18 @@ function dbg(text) {
     };
 
   /** @type {function(...*):?} */
-  function _consoleLog(
+  function _numLog(
   ) {
-  abort('missing function: consoleLog');
+  abort('missing function: numLog');
   }
-  _consoleLog.stub = true;
+  _numLog.stub = true;
+
+  /** @type {function(...*):?} */
+  function _strLog(
+  ) {
+  abort('missing function: strLog');
+  }
+  _strLog.stub = true;
 
   
   var runtimeKeepaliveCounter = 0;
@@ -1207,10 +1214,13 @@ function checkIncomingModuleAPI() {
 }
 var wasmImports = {
   /** @export */
-  consoleLog: _consoleLog
+  numLog: _numLog,
+  /** @export */
+  strLog: _strLog
 };
 var wasmExports = createWasm();
 var ___wasm_call_ctors = createExportWrapper('__wasm_call_ctors');
+var _greet = Module['_greet'] = createExportWrapper('greet');
 var _getDoubleNumber = Module['_getDoubleNumber'] = createExportWrapper('getDoubleNumber');
 var _main = Module['_main'] = createExportWrapper('main');
 var ___errno_location = createExportWrapper('__errno_location');

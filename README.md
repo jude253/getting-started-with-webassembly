@@ -8,5 +8,5 @@ example compile command:
 
 
 ```
-emcc -sEXPORTED_FUNCTIONS=_main,_getDoubleNumber -o=public/program -sERROR_ON_UNDEFINED_SYMBOLS=0 main.c
+emcc -sEXPORTED_FUNCTIONS=_main,_getDoubleNumber,_greet -o=public/program -sERROR_ON_UNDEFINED_SYMBOLS=0 main.c
 ```

@@ -8,10 +8,26 @@
 <body>
     <h1>WebAssembly Demo</h1>
     <script>
+
+        // Read a string out of Web Assembly memory
+        const readMemStr = ( offset, length ) => {
+            const strBuffer = new Uint8Array(wasm.instance.exports.memory.buffer, offset, length)
+            const str = new TextDecoder().decode(strBuffer)
+
+            // Notify and make use of new string
+            window.dispatchEvent( new CustomEvent('wasmValue', {detail: str}) )
+        }
+
+        // Listen for new wasm strings
+        window.addEventListener('wasmValue', str => {
+            console.log('Received a new string from C:', str.detail)
+        })
+
         // Imports object
         const imports = {
             env: {
-                consoleLog: console.log
+                numLog: console.log,
+                strLog: readMemStr,
             }
         }
 
@@ -22,15 +38,6 @@
 
                 // Make the wasm object accessible
                 window.wasm = wasm
-
-                // Log out all exported functions
-                console.log( WebAssembly.Module.exports(wasm.module) )
-
-                wasm.instance.exports.getDoubleNumber(33);
-                
-
-                // Log out all imported functions 
-                console.log( WebAssembly.Module.imports(wasm.module) )
             }
         )
     </script>

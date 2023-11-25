@@ -6,9 +6,16 @@
     <title>WebAssembly Demo</title>
 </head>
 <body>
-    <!-- compile command: emcc lib/demo.c -s WASM=1 --post-js public/ready.js -o public/demo.js -->
     <h1>WebAssembly Demo</h1>
+    <!-- compile command: emcc lib/demo.c -s WASM=1 -s EXPORTED_FUNCTIONS="['_getNum','_main','_getDoubleNum', '_greet']" -o public/demo.js -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='$ccall,$cwrap' -->
     <script src="demo.js"></script>
-    <script></script>
+    <script>
+
+        // Wrap C _greet as a JS function
+        const greet = cwrap('greet', 'string', ['string'] )
+
+        // in console call `greet('john')` 
+        // > 'Hello john'
+    </script>
 </body>
 </html>

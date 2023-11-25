@@ -1062,6 +1062,673 @@ function dbg(text) {
       }
     };
 
+  var reallyNegative = (x) => x < 0 || (x === 0 && (1/x) === -Infinity);
+  
+  var convertI32PairToI53 = (lo, hi) => {
+      // This function should not be getting called with too large unsigned numbers
+      // in high part (if hi >= 0x7FFFFFFFF, one should have been calling
+      // convertU32PairToI53())
+      assert(hi === (hi|0));
+      return (lo >>> 0) + hi * 4294967296;
+    };
+  
+  var convertU32PairToI53 = (lo, hi) => {
+      return (lo >>> 0) + (hi >>> 0) * 4294967296;
+    };
+  
+  var reSign = (value, bits) => {
+      if (value <= 0) {
+        return value;
+      }
+      var half = bits <= 32 ? Math.abs(1 << (bits-1)) // abs is needed if bits == 32
+                            : Math.pow(2, bits-1);
+      // for huge values, we can hit the precision limit and always get true here.
+      // so don't do that but, in general there is no perfect solution here. With
+      // 64-bit ints, we get rounding and errors
+      // TODO: In i64 mode 1, resign the two parts separately and safely
+      if (value >= half && (bits <= 32 || value > half)) {
+        // Cannot bitshift half, as it may be at the limit of the bits JS uses in
+        // bitshifts
+        value = -2*half + value;
+      }
+      return value;
+    };
+  
+  var unSign = (value, bits) => {
+      if (value >= 0) {
+        return value;
+      }
+      // Need some trickery, since if bits == 32, we are right at the limit of the
+      // bits JS uses in bitshifts
+      return bits <= 32 ? 2*Math.abs(1 << (bits-1)) + value
+                        : Math.pow(2, bits)         + value;
+    };
+  
+  var strLen = (ptr) => {
+      var end = ptr;
+      while (HEAPU8[end]) ++end;
+      return end - ptr;
+    };
+  
+  var lengthBytesUTF8 = (str) => {
+      var len = 0;
+      for (var i = 0; i < str.length; ++i) {
+        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
+        // unit, not a Unicode code point of the character! So decode
+        // UTF16->UTF32->UTF8.
+        // See http://unicode.org/faq/utf_bom.html#utf16-3
+        var c = str.charCodeAt(i); // possibly a lead surrogate
+        if (c <= 0x7F) {
+          len++;
+        } else if (c <= 0x7FF) {
+          len += 2;
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+          len += 4; ++i;
+        } else {
+          len += 3;
+        }
+      }
+      return len;
+    };
+  
+  var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
+      assert(typeof str === 'string', `stringToUTF8Array expects a string (got ${typeof str})`);
+      // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
+      // undefined and false each don't write out any bytes.
+      if (!(maxBytesToWrite > 0))
+        return 0;
+  
+      var startIdx = outIdx;
+      var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
+      for (var i = 0; i < str.length; ++i) {
+        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
+        // unit, not a Unicode code point of the character! So decode
+        // UTF16->UTF32->UTF8.
+        // See http://unicode.org/faq/utf_bom.html#utf16-3
+        // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
+        // and https://www.ietf.org/rfc/rfc2279.txt
+        // and https://tools.ietf.org/html/rfc3629
+        var u = str.charCodeAt(i); // possibly a lead surrogate
+        if (u >= 0xD800 && u <= 0xDFFF) {
+          var u1 = str.charCodeAt(++i);
+          u = 0x10000 + ((u & 0x3FF) << 10) | (u1 & 0x3FF);
+        }
+        if (u <= 0x7F) {
+          if (outIdx >= endIdx) break;
+          heap[outIdx++] = u;
+        } else if (u <= 0x7FF) {
+          if (outIdx + 1 >= endIdx) break;
+          heap[outIdx++] = 0xC0 | (u >> 6);
+          heap[outIdx++] = 0x80 | (u & 63);
+        } else if (u <= 0xFFFF) {
+          if (outIdx + 2 >= endIdx) break;
+          heap[outIdx++] = 0xE0 | (u >> 12);
+          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
+          heap[outIdx++] = 0x80 | (u & 63);
+        } else {
+          if (outIdx + 3 >= endIdx) break;
+          if (u > 0x10FFFF) warnOnce('Invalid Unicode code point ' + ptrToString(u) + ' encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).');
+          heap[outIdx++] = 0xF0 | (u >> 18);
+          heap[outIdx++] = 0x80 | ((u >> 12) & 63);
+          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
+          heap[outIdx++] = 0x80 | (u & 63);
+        }
+      }
+      // Null-terminate the pointer to the buffer.
+      heap[outIdx] = 0;
+      return outIdx - startIdx;
+    };
+  /** @type {function(string, boolean=, number=)} */
+  function intArrayFromString(stringy, dontAddNull, length) {
+    var len = length > 0 ? length : lengthBytesUTF8(stringy)+1;
+    var u8array = new Array(len);
+    var numBytesWritten = stringToUTF8Array(stringy, u8array, 0, u8array.length);
+    if (dontAddNull) u8array.length = numBytesWritten;
+    return u8array;
+  }
+  var formatString = (format, varargs) => {
+      assert((varargs & 3) === 0);
+      var textIndex = format;
+      var argIndex = varargs;
+      // This must be called before reading a double or i64 vararg. It will bump the pointer properly.
+      // It also does an assert on i32 values, so it's nice to call it before all varargs calls.
+      function prepVararg(ptr, type) {
+        if (type === 'double' || type === 'i64') {
+          // move so the load is aligned
+          if (ptr & 7) {
+            assert((ptr & 7) === 4);
+            ptr += 4;
+          }
+        } else {
+          assert((ptr & 3) === 0);
+        }
+        return ptr;
+      }
+      function getNextArg(type) {
+        // NOTE: Explicitly ignoring type safety. Otherwise this fails:
+        //       int x = 4; printf("%c\n", (char)x);
+        var ret;
+        argIndex = prepVararg(argIndex, type);
+        if (type === 'double') {
+          ret = HEAPF64[((argIndex)>>3)];
+          argIndex += 8;
+        } else if (type == 'i64') {
+          ret = [HEAP32[((argIndex)>>2)],
+                 HEAP32[(((argIndex)+(4))>>2)]];
+          argIndex += 8;
+        } else {
+          assert((argIndex & 3) === 0);
+          type = 'i32'; // varargs are always i32, i64, or double
+          ret = HEAP32[((argIndex)>>2)];
+          argIndex += 4;
+        }
+        return ret;
+      }
+  
+      var ret = [];
+      var curr, next, currArg;
+      while (1) {
+        var startTextIndex = textIndex;
+        curr = HEAP8[((textIndex)>>0)];
+        if (curr === 0) break;
+        next = HEAP8[((textIndex+1)>>0)];
+        if (curr == 37) {
+          // Handle flags.
+          var flagAlwaysSigned = false;
+          var flagLeftAlign = false;
+          var flagAlternative = false;
+          var flagZeroPad = false;
+          var flagPadSign = false;
+          flagsLoop: while (1) {
+            switch (next) {
+              case 43:
+                flagAlwaysSigned = true;
+                break;
+              case 45:
+                flagLeftAlign = true;
+                break;
+              case 35:
+                flagAlternative = true;
+                break;
+              case 48:
+                if (flagZeroPad) {
+                  break flagsLoop;
+                } else {
+                  flagZeroPad = true;
+                  break;
+                }
+              case 32:
+                flagPadSign = true;
+                break;
+              default:
+                break flagsLoop;
+            }
+            textIndex++;
+            next = HEAP8[((textIndex+1)>>0)];
+          }
+  
+          // Handle width.
+          var width = 0;
+          if (next == 42) {
+            width = getNextArg('i32');
+            textIndex++;
+            next = HEAP8[((textIndex+1)>>0)];
+          } else {
+            while (next >= 48 && next <= 57) {
+              width = width * 10 + (next - 48);
+              textIndex++;
+              next = HEAP8[((textIndex+1)>>0)];
+            }
+          }
+  
+          // Handle precision.
+          var precisionSet = false, precision = -1;
+          if (next == 46) {
+            precision = 0;
+            precisionSet = true;
+            textIndex++;
+            next = HEAP8[((textIndex+1)>>0)];
+            if (next == 42) {
+              precision = getNextArg('i32');
+              textIndex++;
+            } else {
+              while (1) {
+                var precisionChr = HEAP8[((textIndex+1)>>0)];
+                if (precisionChr < 48 ||
+                    precisionChr > 57) break;
+                precision = precision * 10 + (precisionChr - 48);
+                textIndex++;
+              }
+            }
+            next = HEAP8[((textIndex+1)>>0)];
+          }
+          if (precision < 0) {
+            precision = 6; // Standard default.
+            precisionSet = false;
+          }
+  
+          // Handle integer sizes. WARNING: These assume a 32-bit architecture!
+          var argSize;
+          switch (String.fromCharCode(next)) {
+            case 'h':
+              var nextNext = HEAP8[((textIndex+2)>>0)];
+              if (nextNext == 104) {
+                textIndex++;
+                argSize = 1; // char (actually i32 in varargs)
+              } else {
+                argSize = 2; // short (actually i32 in varargs)
+              }
+              break;
+            case 'l':
+              var nextNext = HEAP8[((textIndex+2)>>0)];
+              if (nextNext == 108) {
+                textIndex++;
+                argSize = 8; // long long
+              } else {
+                argSize = 4; // long
+              }
+              break;
+            case 'L': // long long
+            case 'q': // int64_t
+            case 'j': // intmax_t
+              argSize = 8;
+              break;
+            case 'z': // size_t
+            case 't': // ptrdiff_t
+            case 'I': // signed ptrdiff_t or unsigned size_t
+              argSize = 4;
+              break;
+            default:
+              argSize = null;
+          }
+          if (argSize) textIndex++;
+          next = HEAP8[((textIndex+1)>>0)];
+  
+          // Handle type specifier.
+          switch (String.fromCharCode(next)) {
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'p': {
+              // Integer.
+              var signed = next == 100 || next == 105;
+              argSize = argSize || 4;
+              currArg = getNextArg('i' + (argSize * 8));
+              var argText;
+              // Flatten i64-1 [low, high] into a (slightly rounded) double
+              if (argSize == 8) {
+                currArg = next == 117 ? convertU32PairToI53(currArg[0], currArg[1]) : convertI32PairToI53(currArg[0], currArg[1]);
+              }
+              // Truncate to requested size.
+              if (argSize <= 4) {
+                var limit = Math.pow(256, argSize) - 1;
+                currArg = (signed ? reSign : unSign)(currArg & limit, argSize * 8);
+              }
+              // Format the number.
+              var currAbsArg = Math.abs(currArg);
+              var prefix = '';
+              if (next == 100 || next == 105) {
+                argText = reSign(currArg, 8 * argSize).toString(10);
+              } else if (next == 117) {
+                argText = unSign(currArg, 8 * argSize).toString(10);
+                currArg = Math.abs(currArg);
+              } else if (next == 111) {
+                argText = (flagAlternative ? '0' : '') + currAbsArg.toString(8);
+              } else if (next == 120 || next == 88) {
+                prefix = (flagAlternative && currArg != 0) ? '0x' : '';
+                if (currArg < 0) {
+                  // Represent negative numbers in hex as 2's complement.
+                  currArg = -currArg;
+                  argText = (currAbsArg - 1).toString(16);
+                  var buffer = [];
+                  for (var i = 0; i < argText.length; i++) {
+                    buffer.push((0xF - parseInt(argText[i], 16)).toString(16));
+                  }
+                  argText = buffer.join('');
+                  while (argText.length < argSize * 2) argText = 'f' + argText;
+                } else {
+                  argText = currAbsArg.toString(16);
+                }
+                if (next == 88) {
+                  prefix = prefix.toUpperCase();
+                  argText = argText.toUpperCase();
+                }
+              } else if (next == 112) {
+                if (currAbsArg === 0) {
+                  argText = '(nil)';
+                } else {
+                  prefix = '0x';
+                  argText = currAbsArg.toString(16);
+                }
+              }
+              if (precisionSet) {
+                while (argText.length < precision) {
+                  argText = '0' + argText;
+                }
+              }
+  
+              // Add sign if needed
+              if (currArg >= 0) {
+                if (flagAlwaysSigned) {
+                  prefix = '+' + prefix;
+                } else if (flagPadSign) {
+                  prefix = ' ' + prefix;
+                }
+              }
+  
+              // Move sign to prefix so we zero-pad after the sign
+              if (argText.charAt(0) == '-') {
+                prefix = '-' + prefix;
+                argText = argText.substr(1);
+              }
+  
+              // Add padding.
+              while (prefix.length + argText.length < width) {
+                if (flagLeftAlign) {
+                  argText += ' ';
+                } else {
+                  if (flagZeroPad) {
+                    argText = '0' + argText;
+                  } else {
+                    prefix = ' ' + prefix;
+                  }
+                }
+              }
+  
+              // Insert the result into the buffer.
+              argText = prefix + argText;
+              argText.split('').forEach(function(chr) {
+                ret.push(chr.charCodeAt(0));
+              });
+              break;
+            }
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+              // Float.
+              currArg = getNextArg('double');
+              var argText;
+              if (isNaN(currArg)) {
+                argText = 'nan';
+                flagZeroPad = false;
+              } else if (!isFinite(currArg)) {
+                argText = (currArg < 0 ? '-' : '') + 'inf';
+                flagZeroPad = false;
+              } else {
+                var isGeneral = false;
+                var effectivePrecision = Math.min(precision, 20);
+  
+                // Convert g/G to f/F or e/E, as per:
+                // http://pubs.opengroup.org/onlinepubs/9699919799/functions/printf.html
+                if (next == 103 || next == 71) {
+                  isGeneral = true;
+                  precision = precision || 1;
+                  var exponent = parseInt(currArg.toExponential(effectivePrecision).split('e')[1], 10);
+                  if (precision > exponent && exponent >= -4) {
+                    next = ((next == 103) ? 'f' : 'F').charCodeAt(0);
+                    precision -= exponent + 1;
+                  } else {
+                    next = ((next == 103) ? 'e' : 'E').charCodeAt(0);
+                    precision--;
+                  }
+                  effectivePrecision = Math.min(precision, 20);
+                }
+  
+                if (next == 101 || next == 69) {
+                  argText = currArg.toExponential(effectivePrecision);
+                  // Make sure the exponent has at least 2 digits.
+                  if (/[eE][-+]\d$/.test(argText)) {
+                    argText = argText.slice(0, -1) + '0' + argText.slice(-1);
+                  }
+                } else if (next == 102 || next == 70) {
+                  argText = currArg.toFixed(effectivePrecision);
+                  if (currArg === 0 && reallyNegative(currArg)) {
+                    argText = '-' + argText;
+                  }
+                }
+  
+                var parts = argText.split('e');
+                if (isGeneral && !flagAlternative) {
+                  // Discard trailing zeros and periods.
+                  while (parts[0].length > 1 && parts[0].includes('.') &&
+                         (parts[0].slice(-1) == '0' || parts[0].slice(-1) == '.')) {
+                    parts[0] = parts[0].slice(0, -1);
+                  }
+                } else {
+                  // Make sure we have a period in alternative mode.
+                  if (flagAlternative && argText.indexOf('.') == -1) parts[0] += '.';
+                  // Zero pad until required precision.
+                  while (precision > effectivePrecision++) parts[0] += '0';
+                }
+                argText = parts[0] + (parts.length > 1 ? 'e' + parts[1] : '');
+  
+                // Capitalize 'E' if needed.
+                if (next == 69) argText = argText.toUpperCase();
+  
+                // Add sign.
+                if (currArg >= 0) {
+                  if (flagAlwaysSigned) {
+                    argText = '+' + argText;
+                  } else if (flagPadSign) {
+                    argText = ' ' + argText;
+                  }
+                }
+              }
+  
+              // Add padding.
+              while (argText.length < width) {
+                if (flagLeftAlign) {
+                  argText += ' ';
+                } else {
+                  if (flagZeroPad && (argText[0] == '-' || argText[0] == '+')) {
+                    argText = argText[0] + '0' + argText.slice(1);
+                  } else {
+                    argText = (flagZeroPad ? '0' : ' ') + argText;
+                  }
+                }
+              }
+  
+              // Adjust case.
+              if (next < 97) argText = argText.toUpperCase();
+  
+              // Insert the result into the buffer.
+              argText.split('').forEach(function(chr) {
+                ret.push(chr.charCodeAt(0));
+              });
+              break;
+            }
+            case 's': {
+              // String.
+              var arg = getNextArg('i8*');
+              var argLength = arg ? strLen(arg) : '(null)'.length;
+              if (precisionSet) argLength = Math.min(argLength, precision);
+              if (!flagLeftAlign) {
+                while (argLength < width--) {
+                  ret.push(32);
+                }
+              }
+              if (arg) {
+                for (var i = 0; i < argLength; i++) {
+                  ret.push(HEAPU8[((arg++)>>0)]);
+                }
+              } else {
+                ret = ret.concat(intArrayFromString('(null)'.substr(0, argLength), true));
+              }
+              if (flagLeftAlign) {
+                while (argLength < width--) {
+                  ret.push(32);
+                }
+              }
+              break;
+            }
+            case 'c': {
+              // Character.
+              if (flagLeftAlign) ret.push(getNextArg('i8'));
+              while (--width > 0) {
+                ret.push(32);
+              }
+              if (!flagLeftAlign) ret.push(getNextArg('i8'));
+              break;
+            }
+            case 'n': {
+              // Write the length written so far to the next parameter.
+              var ptr = getNextArg('i32*');
+              HEAP32[((ptr)>>2)] = ret.length;
+              break;
+            }
+            case '%': {
+              // Literal percent sign.
+              ret.push(curr);
+              break;
+            }
+            default: {
+              // Unknown specifiers remain untouched.
+              for (var i = startTextIndex; i < textIndex + 2; i++) {
+                ret.push(HEAP8[((i)>>0)]);
+              }
+            }
+          }
+          textIndex += 2;
+          // TODO: Support a/A (hex float) and m (last error) specifiers.
+          // TODO: Support %1${specifier} for arg selection.
+        } else {
+          ret.push(curr);
+          textIndex += 1;
+        }
+      }
+      return ret;
+    };
+  
+  function jsStackTrace() {
+      var error = new Error();
+      if (!error.stack) {
+        // IE10+ special cases: It does have callstack info, but it is only
+        // populated if an Error object is thrown, so try that as a special-case.
+        try {
+          throw new Error();
+        } catch(e) {
+          error = e;
+        }
+        if (!error.stack) {
+          return '(no stack trace available)';
+        }
+      }
+      return error.stack.toString();
+    }
+  
+  /** @param {number=} flags */
+  function getCallstack(flags) {
+      var callstack = jsStackTrace();
+  
+      // Find the symbols in the callstack that corresponds to the functions that
+      // report callstack information, and remove everything up to these from the
+      // output.
+      var iThisFunc = callstack.lastIndexOf('_emscripten_log');
+      var iThisFunc2 = callstack.lastIndexOf('_emscripten_get_callstack');
+      var iNextLine = callstack.indexOf('\n', Math.max(iThisFunc, iThisFunc2))+1;
+      callstack = callstack.slice(iNextLine);
+  
+      // If user requested to see the original source stack, but no source map
+      // information is available, just fall back to showing the JS stack.
+      if (flags & 8 && typeof emscripten_source_map == 'undefined') {
+        warnOnce('Source map information is not available, emscripten_log with EM_LOG_C_STACK will be ignored. Build with "--pre-js $EMSCRIPTEN/src/emscripten-source-map.min.js" linker flag to add source map loading to code.');
+        flags ^= 8;
+        flags |= 16;
+      }
+  
+      // Process all lines:
+      var lines = callstack.split('\n');
+      callstack = '';
+      // New FF30 with column info: extract components of form:
+      // '       Object._main@http://server.com:4324:12'
+      var newFirefoxRe = new RegExp('\\s*(.*?)@(.*?):([0-9]+):([0-9]+)');
+      // Old FF without column info: extract components of form:
+      // '       Object._main@http://server.com:4324'
+      var firefoxRe = new RegExp('\\s*(.*?)@(.*):(.*)(:(.*))?');
+      // Extract components of form:
+      // '    at Object._main (http://server.com/file.html:4324:12)'
+      var chromeRe = new RegExp('\\s*at (.*?) \\\((.*):(.*):(.*)\\\)');
+  
+      for (var l in lines) {
+        var line = lines[l];
+  
+        var symbolName = '';
+        var file = '';
+        var lineno = 0;
+        var column = 0;
+  
+        var parts = chromeRe.exec(line);
+        if (parts && parts.length == 5) {
+          symbolName = parts[1];
+          file = parts[2];
+          lineno = parts[3];
+          column = parts[4];
+        } else {
+          parts = newFirefoxRe.exec(line);
+          if (!parts) parts = firefoxRe.exec(line);
+          if (parts && parts.length >= 4) {
+            symbolName = parts[1];
+            file = parts[2];
+            lineno = parts[3];
+            // Old Firefox doesn't carry column information, but in new FF30, it
+            // is present. See https://bugzilla.mozilla.org/show_bug.cgi?id=762556
+            column = parts[4]|0;
+          } else {
+            // Was not able to extract this line for demangling/sourcemapping
+            // purposes. Output it as-is.
+            callstack += line + '\n';
+            continue;
+          }
+        }
+  
+        var haveSourceMap = false;
+  
+        if (flags & 8) {
+          var orig = emscripten_source_map.originalPositionFor({line: lineno, column: column});
+          haveSourceMap = (orig && orig.source);
+          if (haveSourceMap) {
+            if (flags & 64) {
+              orig.source = orig.source.substring(orig.source.replace(/\\/g, "/").lastIndexOf('/')+1);
+            }
+            callstack += `    at ${symbolName} (${orig.source}:${orig.line}:${orig.column})\n`;
+          }
+        }
+        if ((flags & 16) || !haveSourceMap) {
+          if (flags & 64) {
+            file = file.substring(file.replace(/\\/g, "/").lastIndexOf('/')+1);
+          }
+          callstack += (haveSourceMap ? (`     = ${symbolName}`) : (`    at ${symbolName}`)) + ` (${file}:${lineno}:${column})\n`;
+        }
+      }
+      // Trim extra whitespace at the end of the output.
+      callstack = callstack.replace(/\s+$/, '');
+      return callstack;
+    }
+  var emscriptenLog = (flags, str) => {
+      if (flags & 24) {
+        str = str.replace(/\s+$/, ''); // Ensure the message and the callstack are joined cleanly with exactly one newline.
+        str += (str.length > 0 ? '\n' : '') + getCallstack(flags);
+      }
+  
+      if (flags & 1) {
+        if (flags & 4) {
+          console.error(str);
+        } else if (flags & 2) {
+          console.warn(str);
+        } else if (flags & 512) {
+          console.info(str);
+        } else if (flags & 256) {
+          console.debug(str);
+        } else {
+          console.log(str);
+        }
+      } else if (flags & 6) {
+        err(str);
+      } else {
+        out(str);
+      }
+    };
+  var _emscripten_log = (flags, format, varargs) => {
+      var result = formatString(format, varargs);
+      var str = UTF8ArrayToString(result, 0);
+      emscriptenLog(flags, str);
+    };
+
   var _emscripten_memcpy_js = (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num);
 
   var printCharBuffers = [null,[],[]];
@@ -1246,74 +1913,7 @@ function dbg(text) {
       HEAP8.set(array, buffer);
     };
   
-  var lengthBytesUTF8 = (str) => {
-      var len = 0;
-      for (var i = 0; i < str.length; ++i) {
-        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
-        // unit, not a Unicode code point of the character! So decode
-        // UTF16->UTF32->UTF8.
-        // See http://unicode.org/faq/utf_bom.html#utf16-3
-        var c = str.charCodeAt(i); // possibly a lead surrogate
-        if (c <= 0x7F) {
-          len++;
-        } else if (c <= 0x7FF) {
-          len += 2;
-        } else if (c >= 0xD800 && c <= 0xDFFF) {
-          len += 4; ++i;
-        } else {
-          len += 3;
-        }
-      }
-      return len;
-    };
   
-  var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
-      assert(typeof str === 'string', `stringToUTF8Array expects a string (got ${typeof str})`);
-      // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
-      // undefined and false each don't write out any bytes.
-      if (!(maxBytesToWrite > 0))
-        return 0;
-  
-      var startIdx = outIdx;
-      var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
-      for (var i = 0; i < str.length; ++i) {
-        // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
-        // unit, not a Unicode code point of the character! So decode
-        // UTF16->UTF32->UTF8.
-        // See http://unicode.org/faq/utf_bom.html#utf16-3
-        // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
-        // and https://www.ietf.org/rfc/rfc2279.txt
-        // and https://tools.ietf.org/html/rfc3629
-        var u = str.charCodeAt(i); // possibly a lead surrogate
-        if (u >= 0xD800 && u <= 0xDFFF) {
-          var u1 = str.charCodeAt(++i);
-          u = 0x10000 + ((u & 0x3FF) << 10) | (u1 & 0x3FF);
-        }
-        if (u <= 0x7F) {
-          if (outIdx >= endIdx) break;
-          heap[outIdx++] = u;
-        } else if (u <= 0x7FF) {
-          if (outIdx + 1 >= endIdx) break;
-          heap[outIdx++] = 0xC0 | (u >> 6);
-          heap[outIdx++] = 0x80 | (u & 63);
-        } else if (u <= 0xFFFF) {
-          if (outIdx + 2 >= endIdx) break;
-          heap[outIdx++] = 0xE0 | (u >> 12);
-          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-          heap[outIdx++] = 0x80 | (u & 63);
-        } else {
-          if (outIdx + 3 >= endIdx) break;
-          if (u > 0x10FFFF) warnOnce('Invalid Unicode code point ' + ptrToString(u) + ' encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).');
-          heap[outIdx++] = 0xF0 | (u >> 18);
-          heap[outIdx++] = 0x80 | ((u >> 12) & 63);
-          heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-          heap[outIdx++] = 0x80 | (u & 63);
-        }
-      }
-      // Null-terminate the pointer to the buffer.
-      heap[outIdx] = 0;
-      return outIdx - startIdx;
-    };
   var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
       assert(typeof maxBytesToWrite == 'number', 'stringToUTF8(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!');
       return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
@@ -1401,6 +2001,8 @@ function checkIncomingModuleAPI() {
 }
 var wasmImports = {
   /** @export */
+  emscripten_log: _emscripten_log,
+  /** @export */
   emscripten_memcpy_js: _emscripten_memcpy_js,
   /** @export */
   fd_write: _fd_write
@@ -1408,6 +2010,7 @@ var wasmImports = {
 var wasmExports = createWasm();
 var ___wasm_call_ctors = createExportWrapper('__wasm_call_ctors');
 var _getStr = Module['_getStr'] = createExportWrapper('getStr');
+var _getNumber = Module['_getNumber'] = createExportWrapper('getNumber');
 var _main = createExportWrapper('main');
 var ___errno_location = createExportWrapper('__errno_location');
 var _fflush = Module['_fflush'] = createExportWrapper('fflush');
@@ -1435,9 +2038,7 @@ var missingLibrarySymbols = [
   'writeI53ToU64Signaling',
   'readI53FromI64',
   'readI53FromU64',
-  'convertI32PairToI53',
   'convertI32PairToI53Checked',
-  'convertU32PairToI53',
   'zeroMemory',
   'getHeapMax',
   'abortOnCannotGrowMemory',
@@ -1456,8 +2057,6 @@ var missingLibrarySymbols = [
   'getHostByName',
   'initRandomFill',
   'randomFill',
-  'getCallstack',
-  'emscriptenLog',
   'convertPCtoSourceLocation',
   'readEmAsmArgs',
   'jstoi_q',
@@ -1492,12 +2091,6 @@ var missingLibrarySymbols = [
   'getFunctionAddress',
   'addFunction',
   'removeFunction',
-  'reallyNegative',
-  'unSign',
-  'strLen',
-  'reSign',
-  'formatString',
-  'intArrayFromString',
   'intArrayToString',
   'AsciiToString',
   'stringToAscii',
@@ -1552,7 +2145,6 @@ var missingLibrarySymbols = [
   'getCanvasElementSize',
   'demangle',
   'demangleAll',
-  'jsStackTrace',
   'stackTrace',
   'getEnvStrings',
   'checkWasiClock',
@@ -1639,6 +2231,8 @@ var unexportedSymbols = [
   'setTempRet0',
   'writeStackCookie',
   'checkStackCookie',
+  'convertI32PairToI53',
+  'convertU32PairToI53',
   'ptrToString',
   'exitJS',
   'ENV',
@@ -1653,6 +2247,8 @@ var unexportedSymbols = [
   'Sockets',
   'timers',
   'warnOnce',
+  'getCallstack',
+  'emscriptenLog',
   'UNWIND_CACHE',
   'readEmAsmArgsArray',
   'handleException',
@@ -1662,6 +2258,11 @@ var unexportedSymbols = [
   'getCFunc',
   'freeTableIndexes',
   'functionsInTableMap',
+  'reallyNegative',
+  'unSign',
+  'strLen',
+  'reSign',
+  'formatString',
   'setValue',
   'getValue',
   'PATH',
@@ -1672,6 +2273,7 @@ var unexportedSymbols = [
   'stringToUTF8Array',
   'stringToUTF8',
   'lengthBytesUTF8',
+  'intArrayFromString',
   'UTF16Decoder',
   'stringToUTF8OnStack',
   'writeArrayToMemory',
@@ -1679,6 +2281,7 @@ var unexportedSymbols = [
   'specialHTMLTargets',
   'currentFullscreenStrategy',
   'restoreOldWindowedStyle',
+  'jsStackTrace',
   'ExitStatus',
   'flush_NO_FILESYSTEM',
   'promiseMap',

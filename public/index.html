@@ -7,15 +7,20 @@
 </head>
 <body>
     <h1>WebAssembly Demo</h1>
-    <!-- compile command: emcc lib/demo.c -s WASM=1 -s EXPORTED_FUNCTIONS="['_getNum','_main','_getDoubleNum', '_greet']" -o public/demo.js -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='$ccall,$cwrap' -->
-    <script src="demo.js"></script>
+    <!-- compile command: emcc lib/imports.c -s WASM=1  -o public/imports.js -->
+    <script src="imports.js"></script>
     <script>
 
-        // Wrap C _greet as a JS function
-        const greet = cwrap('greet', 'string', ['string'] )
+        // Return a usable val to C
+        function getNum() {
+            return 22;
+        }
 
-        // in console call `greet('john')` 
-        // > 'Hello john'
+        // Return a usable val to C
+        function getStr() {
+            return "hello";
+        }
+
     </script>
 </body>
 </html>

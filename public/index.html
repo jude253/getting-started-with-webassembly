@@ -6,21 +6,10 @@
     <title>WebAssembly Demo</title>
 </head>
 <body>
+    <!-- compile command: emcc lib/strings.c -s WASM=1 -s EXPORTED_FUNCTIONS="['_getStr']" -o public/strings.js -sEXPORTED_RUNTIME_METHODS=ccall,cwrap -->
+    <!-- stringToUTF8('a new value', _getStr(), lengthBytesUTF8('a new value')+1) 1 extra byte needed to be added for string termination character -->
     <h1>WebAssembly Demo</h1>
-    <!-- compile command: emcc lib/imports.c -s WASM=1  -o public/imports.js -->
-    <script src="imports.js"></script>
-    <script>
-
-        // Return a usable val to C
-        function getNum() {
-            return 22;
-        }
-
-        // Return a usable val to C
-        function getStr() {
-            return "hello";
-        }
-
-    </script>
+    <script src="strings.js"></script>
+    <script></script>
 </body>
 </html>

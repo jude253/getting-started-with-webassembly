@@ -13,7 +13,7 @@
     </style>
 </head>
 <body>
-    <!-- emcc lib/canvas.c -s WASM=1 -s EXPORTED_FUNCTIONS="['_main','_getCircles']" -o public/canvas.js -->
+    <!-- emcc lib/canvas.c -s WASM=1 -s EXPORTED_FUNCTIONS="['_main','_getCircles']" -o public/canvas.js -O3 -->
     <canvas id="canvas" width="2000" height="2000"></canvas>
     <script src="canvas.js"></script>
     <script>
